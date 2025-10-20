@@ -1,6 +1,5 @@
-# Day2 학생용 스캐폴딩 — rag_store.py
+# Day2 스캐폴딩
 # 목적: 텍스트 임베딩 → FAISS 인덱스 업서트/검색
-# 강사용과 동일 시그니처/리턴 포맷 유지.
 
 import os, json, faiss, numpy as np
 from typing import List, Dict, Tuple
@@ -51,7 +50,7 @@ class FaissStore:
            - 차원 불일치 시 안전하게 전체 재빌드
         반환: (index.ntotal, 이번에 추가한 개수)
         """
-        # 기본: 간단 재빌드 구현 (권장)
+        # 간단 재빌드 구현
         old = {c["id"]: c for c in self._load_meta()}
         for c in chunks:
             old[c["id"]] = c

@@ -1,6 +1,6 @@
 # Day2 스캐폴딩
 # 목적: 폴더 자동 스캔 → ingest → upsert → search → (선택) web search → 표 출력 → QA
-# 프로젝트의 흐름/출력 구조를 따르되, 핵심 호출은 여러분이 연결 직접 연결해보세요.
+# 프로젝트의 흐름/출력 구조를 따르되, 핵심 호출은 여러분이 직접 연결해보세요.
 
 import os, glob
 from datetime import datetime

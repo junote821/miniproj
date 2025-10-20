@@ -69,5 +69,3 @@ def answer_with_context(question: str, chunks: List[Dict], k_refs: int = 3) -> s
         s = chunks[0].get("source", "")
         body = body.strip() + f" [ref1:{t}|{s}]"
     return body
-
-# (선택 과제) 스트리밍 버전은 강사용 참고하여 직접 구현해도 좋음
