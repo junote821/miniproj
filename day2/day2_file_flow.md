@@ -14,7 +14,8 @@ sequenceDiagram
 
     Main->>Store: search(question, k)
     Store-->>Main: hits: List[chunk + score]
-
+    %% 반환: {"id", "title", "url", "source", "summary", "text", "page", "kind", "score"}
+    
     Main->>Agent: answer_with_context(question, hits)
     Agent-->>Main: answer(with [refN:title|source])
 

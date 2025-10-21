@@ -1,60 +1,43 @@
-# Day1 템플릿
-# 역할:
-#  - SummarizerAgent: 입력 텍스트를 5문장 핵심 요약
-#  - ClassifierAgent: 입력 주제를 간단 도메인(Healthcare/ICT/Energy/Etc)으로 분류
-#
-# 아래는 "프롬프트/지시문"과 "입력/출력" 구조를 익히는 목적
-# TODO 주석을 따라가며 프롬프트를 조정해 보세요.
+import os, asyncio
+from dotenv import load_dotenv, find_dotenv
+load_dotenv(find_dotenv(), override=False)
 
-from typing import List
-from google.adk.agents import Agent
-from google.genai.types import Part, UserContent
+from google.adk.agents import LlmAgent
+from google.adk.runners import InMemoryRunner
+from google.genai import types
 from google.adk.models.lite_llm import LiteLlm
 
-# ---- SummarizerAgent ----
-summarizer_agent = Agent(
+MODEL_NAME = os.getenv("MODEL_NAME", "openai/gpt-4o-mini")
+
+# TODO-1: 요약 에이전트 시스템 프롬프트 작성 (5문장 한국어 요약, 금지/허용 규칙 포함)
+SUMMARIZER_INST = """
+(여기에 5문장 요약 규칙을 한국어로 작성하세요)
+"""
+
+# TODO-2: 분류 에이전트 시스템 프롬프트 작성 (labels: healthcare, ict, energy, etc 중 1개만 반환)
+CLASSIFIER_INST = """
+(여기에 도메인 라벨 분류 규칙을 작성하세요)
+"""
+
+summarizer_agent = LlmAgent(
     name="summarizer_agent",
-    model=LiteLlm(model="openai/gpt-4o-mini"),  # TODO: 필요 시 .env MODEL_NAME 사용하도록 변경
-    instruction=(
-        "You are a concise editor. Summarize the given content into exactly 5 Korean sentences. "
-        "Keep facts. Avoid hallucinations. Do not add sources not present in the input."
-    ),
+    model=LiteLlm(model=MODEL_NAME) if "/" in MODEL_NAME else MODEL_NAME,
+    instruction=SUMMARIZER_INST
 )
+classifier_agent = LlmAgent(
+    name="classifier_agent",
+    model=LiteLlm(model=MODEL_NAME) if "/" in MODEL_NAME else MODEL_NAME,
+    instruction=CLASSIFIER_INST
+)
+
+async def _run_once(agent: LlmAgent, text: str) -> str:
+    # TODO-3: InMemoryRunner로 스트리밍 실행하고 최종 응답 파트의 텍스트를 반환
+    raise NotImplementedError("TODO-3: _run_once 구현")
 
 def summarize_text(text: str) -> str:
-    """
-    입력 텍스트 -> 5문장 요약
-    ADK는 이벤트 파트를 통해 멀티모달 입력을 받습니다.
-    여기서는 텍스트 파트만 전달합니다.
-    """
-    content = UserContent(parts=[Part.from_text(text)])
-    result = summarizer_agent.run(content)
-    # result.text 가 없을 수도 있어 .text 접근 전 기본값 처리
-    return getattr(result, "text", "").strip()
-
-# ---- ClassifierAgent ----
-classifier_agent = Agent(
-    name="classifier_agent",
-    model=LiteLlm(model="openai/gpt-4o-mini"),
-    instruction=(
-        "Classify the user's topic into one of: Healthcare, ICT, Energy, Etc. "
-        "Return only the label (one word). If unsure, return 'Etc'."
-    ),
-)
+    # TODO-4: summarizer_agent에 text를 넣어 5문장 요약 문자열 반환
+    raise NotImplementedError("TODO-4: summarize_text 구현")
 
 def classify_topic(text: str) -> str:
-    """
-    입력 텍스트 -> 간단 도메인 레이블
-    """
-    content = UserContent(parts=[Part.from_text(text)])
-    result = classifier_agent.run(content)
-    label = getattr(result, "text", "Etc").strip()
-    # 안전하게 표준 라벨 집합으로 정규화
-    label_up = label.lower()
-    if "health" in label_up or "의료" in label_up:
-        return "Healthcare"
-    if "ict" in label_up or "it" in label_up or "정보통신" in label_up:
-        return "ICT"
-    if "energy" in label_up or "에너지" in label_up:
-        return "Energy"
-    return "Etc"
+    # TODO-5: classifier_agent에 text를 넣어 라벨(healthcare/ict/energy/etc) 반환 (+소문자/후처리)
+    raise NotImplementedError("TODO-5: classify_topic 구현")

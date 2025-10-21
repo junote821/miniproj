@@ -92,6 +92,16 @@
 * **출력**: `[{... , score: float}, ...]`
 * **연결**: `main.py`에서 QA 컨텍스트로 사용
 
+* **반환 스키마 표준화**  
+`search(query, k)`는 항상 다음 키를 포함한 딕셔너리 리스트를 반환합니다:  
+`{"id","title","url","source","summary","text","page","kind","score"}`  
+이 스키마는 Day3/Day4 라우터·리포터에서 그대로 소비됩니다.
+
+* **메타/ID 정합성 유지**  
+벡터 인덱스 순서와 메타(chunks.jsonl)의 ID 매핑을 위해 `ids.json`을 함께 유지합니다.  
+`index.search()`가 반환한 순번 → `ids.json`의 ID → `chunks.jsonl` 메타 로 합쳐 최종 히트를 구성합니다.
+
+
 ---
 
 ## 3) `day2/agents.py`
