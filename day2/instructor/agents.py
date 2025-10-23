@@ -1,6 +1,5 @@
-import os
-import asyncio
-from typing import List, Dict
+import os, asyncio, threading, queue
+from typing import List, Dict, Awaitable
 from dotenv import load_dotenv, find_dotenv
 
 load_dotenv(find_dotenv(), override=False)
@@ -10,66 +9,78 @@ from google.adk.runners import InMemoryRunner
 from google.genai import types
 from google.adk.models.lite_llm import LiteLlm
 
-# ----- 모델/시스템 프롬프트 -----
 MODEL_NAME = os.getenv("MODEL_NAME", "openai/gpt-4o-mini")
 
-RAG_INST = """역할: 근거 기반 한국어 분석가.
-규칙:
-- 제공된 컨텍스트(아래 bullets)만 사용, 외부 지식/추정 금지.
-- 사실/수치/정의는 원문 표현을 유지하고, 해석은 최소화.
-- 답변은 한국어 한글 위주로 간결히.
-- 끝에 참고 인용을 공백으로 나열: [ref1:제목|URL] [ref2:제목|URL]
-- 컨텍스트가 부족하면 '해당 자료에서 확증 불가'를 분명히 표기.
-출력: 단락형 한국어 답변 1~2개 + 인용 라인.
+RAG_INST = """당신은 근거 기반으로만 답하는 분석가입니다.
+- 제공된 컨텍스트 외 추측 금지, 근거 없는 주장 금지
+- 핵심만 간결하게 한국어로 작성
+- 답변 끝에 참고 인용을 공백으로 구분하여 표기: [ref1:제목|URL] [ref2:제목|URL]
 """
 
 rag_agent = LlmAgent(
-    name="adk_day2_rag_agent",
-    model=LiteLlm(model=MODEL_NAME) if "/" in MODEL_NAME else MODEL_NAME,
+    name="rag_agent",
+    model=LiteLlm(model=MODEL_NAME),
     instruction=RAG_INST,
 )
 
-# ----- 내부 실행 유틸(비동기) -----
-async def _run_once(agent: LlmAgent, prompt: str) -> str:
-    """ADK InMemoryRunner로 프롬프트 1회 실행하고 최종 텍스트를 반환."""
-    app_name = agent.name
-    runner = InMemoryRunner(agent=agent, app_name=app_name)
-
+async def _run_once_async(agent: LlmAgent, prompt: str) -> str:
+    """ADK Runner를 ASYNC로 한 번 실행하고 텍스트만 모아 반환."""
+    runner = InMemoryRunner(agent=agent, app_name=agent.name)
     try:
         await runner.session_service.create_session(
-            app_name=app_name, user_id="instructor", session_id="sess1"
+            app_name=agent.name, user_id="instructor", session_id="sess1"
         )
     except Exception:
         pass
 
     content = types.Content(role="user", parts=[types.Part(text=prompt)])
-    chunks: List[str] = []
-
-    async for ev in runner.run_async(
-        user_id="instructor", session_id="sess1", new_message=content
+    out_chunks: list[str] = []
+    async for event in runner.run_async(
+        user_id="instructor",
+        session_id="sess1",
+        new_message=content,
     ):
+        if event and getattr(event, "content", None) and event.content.parts:
+            for p in event.content.parts:
+                if p and getattr(p, "text", None):
+                    out_chunks.append(p.text)
+    return "".join(out_chunks).strip()
+
+def _run_blocking(coro: Awaitable[str]) -> str:
+    """
+    이벤트 루프 유무 관계없이 안전 실행:
+    - 루프 없음: asyncio.run(coro)
+    - 루프 있음: 별도 스레드에서 asyncio.run(coro)
+    """
+    try:
+        asyncio.get_running_loop()
+        in_loop = True
+    except RuntimeError:
+        in_loop = False
+
+    if not in_loop:
+        return asyncio.run(coro)
+
+    q: "queue.Queue[str]" = queue.Queue(maxsize=1)
+
+    def _worker():
         try:
-            if getattr(ev, "content", None) and ev.content.parts:
-                for p in ev.content.parts:
-                    if getattr(p, "text", None):
-                        chunks.append(p.text)
-        except Exception:
-            continue
+            res = asyncio.run(coro)
+        except Exception as e:
+            res = f"(error) {e}"
+        q.put(res)
 
-    out = ("".join(chunks)).strip()
-    return out or "(no output)"
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+    t.join()
+    return q.get()
 
-# ----- 공개 API -----
 def answer_with_context(query: str, hits: List[Dict], k_refs: int = 3) -> str:
     """
     hits: rag_store.search() 표준 스키마
       {id,title,url,source,summary,text,page,kind,score}
     """
-    if not hits:
-        return "컨텍스트가 없어 답변을 생성할 수 없습니다. (로컬 문서 미탐색)"
-
-    # 상위 6개를 불릿 컨텍스트로 구성
-    bullets: List[str] = []
+    bullets = []
     for h in hits[:6]:
         title = h.get("title") or ""
         page = h.get("page")
@@ -79,14 +90,13 @@ def answer_with_context(query: str, hits: List[Dict], k_refs: int = 3) -> str:
         body = (txt[:800] + ("…" if len(txt) > 800 else "")) if txt else ""
         bullets.append(f"{head}\n{body}")
 
-    # 인용 3개
-    refs: List[str] = []
-    for i, h in enumerate(hits[:max(1, k_refs)], 1):
+    refs = []
+    for i, h in enumerate(hits[:k_refs], 1):
         refs.append(f"[ref{i}:{h.get('title','ref')}|{h.get('url','')}]")
 
     prompt = f"""질문: {query}
 
-아래 컨텍스트만 근거로 간결하게 답하라(추측 금지).
+아래 컨텍스트를 바탕으로만 간결하게 답변하라(추측 금지).
 
 컨텍스트:
 {os.linesep.join(bullets)}
@@ -94,4 +104,4 @@ def answer_with_context(query: str, hits: List[Dict], k_refs: int = 3) -> str:
 참고 인용:
 {" ".join(refs)}
 """
-    return asyncio.run(_run_once(rag_agent, prompt))
+    return _run_blocking(_run_once_async(rag_agent, prompt)) or ""

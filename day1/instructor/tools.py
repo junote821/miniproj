@@ -2,7 +2,7 @@ import os
 import re
 import time
 import requests
-from typing import Any, Dict, List, Callable
+from typing import Any, Dict, List, Callable, Optional
 
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "12"))
 
@@ -127,3 +127,70 @@ class SummarizeUrlTool:
                 return {"url": url, "summary": f"[ERROR] failed to fetch: {e}"}
         summary = self.summarize_fn(text)
         return {"url": url, "summary": summary}
+
+
+# ----------------- yfinance StockPriceTool -----------------
+try:
+    import yfinance as yf
+except Exception:
+    yf = None
+
+_KR_TICKER_HINTS = {
+    "삼성전자": "005930.KS",
+    "삼성전자우": "005935.KS",
+}
+
+def _guess_ticker(query: str) -> Optional[str]:
+    q = (query or "").lower()
+    # 숫자 티커
+    m = re.findall(r"\b(005930|005935)\b", q)
+    if m:
+        return (m[0] + ".KS")
+    # 한글 이름 힌트
+    for k,v in _KR_TICKER_HINTS.items():
+        if k in query:
+            return v
+    # 영문명 힌트
+    if "samsung electronics" in q:
+        return "005930.KS"
+    return None
+
+class StockPriceTool:
+    """
+    yfinance 기반 단순 스냅샷
+    out:
+      {"symbol","name","price","change","change_pct","currency","market_time","open","high","low","prev_close","volume","market_cap"}
+    """
+    def run(self, query_or_symbol: str) -> Dict[str, Any]:
+        if yf is None:
+            return {"error":"yfinance_not_installed"}
+        sym = query_or_symbol
+        if not re.search(r"[A-Za-z]{1,5}\.[A-Z]{2}|^\d{5}\.KS$", sym):
+            hint = _guess_ticker(query_or_symbol)
+            if hint: sym = hint
+        try:
+            t = yf.Ticker(sym)
+            info = t.fast_info  # 빠르고 안전
+            price = float(info.get("last_price") or 0.0)
+            prev = float(info.get("previous_close") or 0.0)
+            ch = price - prev if prev else 0.0
+            ch_pct = (ch / prev * 100.0) if prev else 0.0
+            out = {
+                "symbol": sym,
+                "name": "Samsung Electronics" if sym.startswith("00593") else sym,
+                "price": price,
+                "change": ch,
+                "change_pct": ch_pct,
+                "currency": info.get("currency") or "KRW",
+                "market_time": int(info.get("last_price_time") or 0),
+                "open": float(info.get("open") or 0.0),
+                "high": float(info.get("day_high") or 0.0),
+                "low": float(info.get("day_low") or 0.0),
+                "prev_close": prev,
+                "volume": int(info.get("last_volume") or 0),
+                "market_cap": float(info.get("market_cap") or 0.0),
+                "provider": "yfinance",
+            }
+            return out
+        except Exception as e:
+            return {"symbol": sym, "error": f"{e}"}

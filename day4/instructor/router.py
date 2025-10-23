@@ -1,6 +1,7 @@
-import os, json, re, asyncio
-from typing import Any, Dict, List
+import os, json, asyncio, re
+from typing import Dict, Any, List
 from dotenv import load_dotenv, find_dotenv
+
 load_dotenv(find_dotenv(), override=False)
 
 from google.adk.agents import LlmAgent
@@ -8,107 +9,88 @@ from google.adk.models.lite_llm import LiteLlm
 from google.adk.runners import InMemoryRunner
 from google.genai import types
 
-# Day2: quick RAG signal
-from day2.instructor.rag_store import FaissStore
-from day2.instructor.agents import answer_with_context
-
-from day4.instructor.prompts import ROUTER_INST
-
 MODEL_NAME = os.getenv("MODEL_NAME", "openai/gpt-4o-mini")
-INDEX_DIR  = os.getenv("D2_INDEX_DIR", "data/processed/day2/faiss")
 
-GOV_WORDS = ["사업공고","공고","입찰","모집","조달","공모","NIPA","정부과제"]
+# 금융 질의 감지: 주가/주식/가격/티커/기업정보/재무/시총/지표
+FIN_PAT = re.compile(
+    r"(주가|주식|가격|시세|티커|ticker|기업\s*정보|재무|재무제표|분기실적|연간실적|시총|per|pbr|eps|배당)",
+    re.I,
+)
 
-# ROUTER_INST = """
-# You are a planner. Decide a minimal tool plan given the query.
-# Tools:
-# - day1.research {top_n,summarize_top}
-# - day2.rag {k}
-# - day3.government {pages,items,base_year}
-
-# Rules:
-# - If query contains gov keywords, include day3.government first. Optionally add day2.rag.
-# - Else try day2.rag first; if likely insufficient, add day1.research.
-# Output JSON only:
-# {"plan":[{"tool":"...","params":{...}},...], "final_output":"research_report|government_proposal","reasons":["..."]}
-# """
-
-def _has_gov_kw(q: str) -> bool:
-    ql = (q or "").lower()
-    return any(k.lower() in ql for k in GOV_WORDS)
-
-def _rag_ok(query: str, min_top: float = 0.25, min_cov: int = 3) -> tuple[bool, list[dict], float]:
-    store = FaissStore.load_or_new(INDEX_DIR)
-    if store.ntotal() <= 0:
-        return False, [], 0.0
-    hits = store.search(query, k=6)
-    top = hits[0]["score"] if hits else 0.0
-    cov = sum(1 for h in hits if h.get("score",0) >= (min_top*0.7))
-    return (top >= min_top and cov >= min_cov), hits, top
+# (옵션) LLM 기반 플래너를 계속 쓰고 싶다면 prompts.ROUTER_INST를 유지
+try:
+    from .prompts import ROUTER_INST
+except Exception:
+    ROUTER_INST = "You are a planner. Return JSON with keys: plan, final_output, reasons."
 
 async def _ask_planner(query: str) -> str:
     agent = LlmAgent(
-        name="d4_router",
+        name="router_planner",
         model=LiteLlm(model=MODEL_NAME),
         instruction=ROUTER_INST.strip(),
     )
     runner = InMemoryRunner(agent=agent, app_name=agent.name)
     try:
-        await runner.session_service.create_session(app_name=agent.name, user_id="u", session_id="s")
+        await runner.session_service.create_session(
+            app_name=agent.name, user_id="u", session_id="plan"
+        )
     except Exception:
         pass
-    out = ""
+
+    text = ""
     async for ev in runner.run_async(
-        user_id="u", session_id="s",
+        user_id="u", session_id="plan",
         new_message=types.Content(role="user", parts=[types.Part(text=query)])
     ):
         if ev.is_final_response() and ev.content and ev.content.parts:
-            out = ev.content.parts[0].text or ""
-    return out
+            text = ev.content.parts[0].text or ""
+    return text
 
+def _normalize_plan(obj: Any) -> Dict[str, Any]:
+    if isinstance(obj, dict):
+        if "plan" in obj:
+            obj.setdefault("intent", "research")
+            obj.setdefault("confidence", 0.7)
+            obj.setdefault("reasons", [])
+            return obj
+        if "intent" in obj:
+            obj.setdefault("plan", [])
+            obj.setdefault("confidence", 0.6)
+            obj.setdefault("reasons", [])
+            return obj
+    return {"intent": "research", "confidence": 0.5, "reasons": ["planner-fallback"], "plan": []}
 
-RECENT_TOKENS = ["최신","최근","요즘","올해","분기","이번달","이번 달","지난달","업데이트","업데이트된"]
+def route(query: str) -> dict:
+    q = (query or "").strip()
 
-def _has_recent(q: str) -> bool:
-    ql = (q or "").lower()
-    return any(tok.lower() in ql for tok in RECENT_TOKENS)
-
-def route(query: str) -> Dict[str, Any]:
-    # 정부 키워드 힌트는 그대로
-    if _has_gov_kw(query):
-        plan = [
-            {"tool":"day3.government","params":{"pages":int(os.getenv("NIPA_MAX_PAGES","1")),"items":10,"base_year":int(os.getenv("NIPA_MIN_YEAR","2025"))}},
-            {"tool":"day2.rag","params":{"k":5}}
-        ]
-        return {"intent":"government","confidence":0.85,"reasons":["gov-keyword"],"plan":plan,"route":"PLANNER_ONLY","hits":[]}
-
-    # RAG-first quick check
-    ok, hits, top = _rag_ok(query)
-
-    # [NEW] 최신성 포함 시엔 RAG 즉답 금지 → 하이브리드 플랜으로 유도
-    if ok and not _has_recent(query):
-        ans = answer_with_context(query, hits, k_refs=3)
+    # 1) 금융 질의는 강제 플랜: stock + research, RAG/정부 제외
+    if FIN_PAT.search(q):
         return {
-            "intent":"answer","confidence":0.9,"reasons":["rag-first-ok"],
-            "plan":[{"tool":"day2.rag","params":{"k":6}}],
-            "route":"RAG","hits":hits,"answer":ans,"top":top
+            "intent": "finance",
+            "confidence": 0.95,
+            "reasons": ["finance-intent: stock+web only"],
+            "plan": [
+                {"tool": "day1.stock", "params": {"q": q}},
+                {"tool": "day1.research", "params": {"top_n": 5, "summarize_top": 2}},
+            ],
+            "final_output": "research_report",
+            "route": "PLANNER_ONLY",
+            "hits": [],
         }
 
-    # fallback / 혹은 최신성 → 하이브리드 기본 플랜
+    # 2) 나머지는 (선택) LLM 플래너 사용 → 없으면 간단 웹 폴백
     try:
-        obj = json.loads(asyncio.run(_ask_planner(query)))
+        text = asyncio.run(_ask_planner(q))
+        obj = _normalize_plan(json.loads(text))
     except Exception:
-        obj = {}
-    if not isinstance(obj, dict) or "plan" not in obj:
-        obj = {
-            "plan":[
-                {"tool":"day2.rag","params":{"k":5}},
-                {"tool":"day1.research","params":{"top_n":5,"summarize_top":2}}
-            ],
-            "final_output":"research_report",
-            "reasons":["fallback-minimal" + ("-recent" if _has_recent(query) else "")]
-        }
-    obj.setdefault("final_output","research_report")
-    obj.setdefault("reasons",[])
-    obj["route"]="PLANNER_ONLY"; obj["hits"]=hits; obj["top"]=top
+        obj = _normalize_plan(None)
+
+    if not obj.get("plan"):
+        obj["plan"] = [
+            {"tool": "day1.research", "params": {"top_n": 5, "summarize_top": 2}}
+        ]
+        obj["reasons"].append("web-fallback-default")
+    obj.setdefault("final_output", "research_report")
+    obj["route"] = "PLANNER_ONLY"
+    obj["hits"] = []
     return obj

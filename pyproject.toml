@@ -15,5 +15,6 @@ dependencies = [
     "pypdf>=6.1.2",
     "pypdf2>=3.0.1",
     "python-dotenv>=1.1.1",
+    "yfinance>=0.2.66",
 ]
 
