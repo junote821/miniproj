@@ -1,5 +1,5 @@
-import os, json, asyncio, re
-from typing import Dict, Any, List, Optional
+import os, json, re, asyncio
+from typing import Any, Dict, List
 from dotenv import load_dotenv, find_dotenv
 load_dotenv(find_dotenv(), override=False)
 
@@ -8,160 +8,107 @@ from google.adk.models.lite_llm import LiteLlm
 from google.adk.runners import InMemoryRunner
 from google.genai import types
 
+# Day2: quick RAG signal
 from day2.instructor.rag_store import FaissStore
 from day2.instructor.agents import answer_with_context
-from .prompts import ROUTER_INST
+
+from day4.instructor.prompts import ROUTER_INST
 
 MODEL_NAME = os.getenv("MODEL_NAME", "openai/gpt-4o-mini")
 INDEX_DIR  = os.getenv("D2_INDEX_DIR", "data/processed/day2/faiss")
 
-MIN_TOP_SCORE = float(os.getenv("RAG_MIN_TOP_SCORE", "0.25"))
-MIN_COVERED   = int(os.getenv("RAG_MIN_COVERED", "3"))
+GOV_WORDS = ["사업공고","공고","입찰","모집","조달","공모","NIPA","정부과제"]
 
-HINT_GOV = os.getenv("ROUTER_HINT_GOV", "0") == "1"  # 운영 토글(옵션)
+# ROUTER_INST = """
+# You are a planner. Decide a minimal tool plan given the query.
+# Tools:
+# - day1.research {top_n,summarize_top}
+# - day2.rag {k}
+# - day3.government {pages,items,base_year}
 
-# ----------------------------- 유틸 -----------------------------
-def _quality_ok(hits: List[Dict], min_top: float = MIN_TOP_SCORE, min_cov: int = MIN_COVERED) -> bool:
-    if not hits:
-        return False
-    top_ok = hits[0].get("score", 0.0) >= min_top
-    covered = sum(1 for h in hits if h.get("score", 0.0) >= (min_top * 0.7))
-    return top_ok and (covered >= min_cov)
+# Rules:
+# - If query contains gov keywords, include day3.government first. Optionally add day2.rag.
+# - Else try day2.rag first; if likely insufficient, add day1.research.
+# Output JSON only:
+# {"plan":[{"tool":"...","params":{...}},...], "final_output":"research_report|government_proposal","reasons":["..."]}
+# """
 
-def _looks_like_government(q: str) -> bool:
-    """조사/띄어쓰기/어순 변화까지 허용한 정부 공고 의도 감지(항상 사용)."""
-    q = (q or "").lower()
-    return bool(re.search(r"(사업\s*공고|공고|입찰|모집|조달|공모|지원\s*사업)", q))
+def _has_gov_kw(q: str) -> bool:
+    ql = (q or "").lower()
+    return any(k.lower() in ql for k in GOV_WORDS)
 
-def _pre_hint_intent(query: str) -> Optional[str]:
-    """ROUTER_HINT_GOV=1일 때만 사전 힌트로 우선 government를 돌려줌(선택)."""
-    if not HINT_GOV:
-        return None
-    return "government" if _looks_like_government(query) else None
-
-def _extract_json(text: str) -> Dict[str, Any]:
-    if not text:
-        return {}
-    t = text.strip()
-    m = re.search(r"```json\s*(\{.*?\})\s*```", t, re.S)
-    if m: t = m.group(1)
-    m = re.search(r"(\{.*\})", t, re.S)
-    if m: t = m.group(1)
-    try:
-        return json.loads(t)
-    except Exception:
-        return {}
+def _rag_ok(query: str, min_top: float = 0.25, min_cov: int = 3) -> tuple[bool, list[dict], float]:
+    store = FaissStore.load_or_new(INDEX_DIR)
+    if store.ntotal() <= 0:
+        return False, [], 0.0
+    hits = store.search(query, k=6)
+    top = hits[0]["score"] if hits else 0.0
+    cov = sum(1 for h in hits if h.get("score",0) >= (min_top*0.7))
+    return (top >= min_top and cov >= min_cov), hits, top
 
 async def _ask_planner(query: str) -> str:
     agent = LlmAgent(
-        name="router-planner",
-        model=LiteLlm(model=MODEL_NAME) if "/" in MODEL_NAME else MODEL_NAME,
+        name="d4_router",
+        model=LiteLlm(model=MODEL_NAME),
         instruction=ROUTER_INST.strip(),
     )
     runner = InMemoryRunner(agent=agent, app_name=agent.name)
     try:
-        await runner.session_service.create_session(
-            app_name=agent.name, user_id="u", session_id="plan"
-        )
+        await runner.session_service.create_session(app_name=agent.name, user_id="u", session_id="s")
     except Exception:
         pass
-
-    text = ""
+    out = ""
     async for ev in runner.run_async(
-        user_id="u", session_id="plan",
+        user_id="u", session_id="s",
         new_message=types.Content(role="user", parts=[types.Part(text=query)])
     ):
-        try:
-            is_final = getattr(ev, "is_final_response", lambda: False)()
-            content = getattr(ev, "content", None)
-            if is_final and content and getattr(content, "parts", None):
-                part0 = content.parts[0]
-                if getattr(part0, "text", None):
-                    text = part0.text or ""
-        except Exception:
-            continue
-    return text
+        if ev.is_final_response() and ev.content and ev.content.parts:
+            out = ev.content.parts[0].text or ""
+    return out
 
-def _normalize_plan(obj: Any) -> Dict[str, Any]:
-    if isinstance(obj, dict):
-        if "plan" in obj:
-            obj.setdefault("intent", "research")
-            obj.setdefault("confidence", 0.7)
-            obj.setdefault("reasons", [])
-            return obj
-        if "intent" in obj:
-            obj.setdefault("plan", [])
-            obj.setdefault("confidence", 0.6)
-            obj.setdefault("reasons", [])
-            return obj
-    return {"intent": "research", "confidence": 0.5, "reasons": ["planner-fallback"], "plan": []}
 
-# ----------------------------- Router 본체 -----------------------------
-def route(query: str) -> dict:
-    # 0) RAG-First
-    store = FaissStore.load_or_new(INDEX_DIR)
-    hits: List[Dict] = store.search(query, k=6) if store.ntotal() > 0 else []
-    if _quality_ok(hits):
-        answer = answer_with_context(query, hits, k_refs=3)
-        return {
-            "intent": "answer",
-            "confidence": 0.9,
-            "reasons": ["rag-first-ok"],
-            "plan": [{"tool": "rag_answer", "params": {"k": 6, "k_refs": 3}}],
-            "route": "RAG",
-            "hits": hits,
-            "answer": answer,
-        }
+RECENT_TOKENS = ["최신","최근","요즘","올해","분기","이번달","이번 달","지난달","업데이트","업데이트된"]
 
-    # 1) (옵션) 사전 힌트: 운영상 빠른 우회가 필요하면 사용
-    intent_hint = _pre_hint_intent(query)
-    if intent_hint == "government":
-        return {
-            "intent": "government",
-            "confidence": 0.8,
-            "reasons": ["pre-hint:government"],
-            "plan": [
-                {"tool": "day3.government", "params": {"pages": 1, "items": 10, "base_year": 2025}},
-                {"tool": "day2.rag", "params": {"k": 5}},
-            ],
-            "route": "PLANNER_ONLY",
-            "hits": hits,
-        }
+def _has_recent(q: str) -> bool:
+    ql = (q or "").lower()
+    return any(tok.lower() in ql for tok in RECENT_TOKENS)
 
-    # 2) 플래너 호출
-    try:
-        raw = asyncio.run(_ask_planner(query))
-        obj = _normalize_plan(_extract_json(raw))
-    except Exception:
-        obj = _normalize_plan(None)
-
-    # 3) (항상 적용) 의미 기반 정부 의도 감지 → 플랜에 government 주입
-    try:
-        has_gov = any((s.get("tool") or "").lower() in ("day3.government", "government") for s in obj.get("plan", []))
-    except Exception:
-        has_gov = False
-    if _looks_like_government(query) and not has_gov:
-        obj.setdefault("reasons", []).append("inject-government-by-intent")
-        # government 스텝을 맨 앞에 추가, rag 보강을 뒤에 추가
-        obj["plan"] = [
-            {"tool": "day3.government", "params": {"pages": 1, "items": 10, "base_year": 2025}},
-            {"tool": "day2.rag", "params": {"k": 5}},
-        ] + (obj.get("plan") or [])
-        obj["final_output"] = obj.get("final_output") or "government_proposal"
-
-    # 4) 플랜 없으면 기본 웹 폴백
-    if not obj.get("plan"):
-        obj["plan"] = [
-            {"tool": "web_search", "params": {"q": query, "k": 6}},
-            {"tool": "writer_with_context", "params": {"style": "ko-concise-with-refs"}},
+def route(query: str) -> Dict[str, Any]:
+    # 정부 키워드 힌트는 그대로
+    if _has_gov_kw(query):
+        plan = [
+            {"tool":"day3.government","params":{"pages":int(os.getenv("NIPA_MAX_PAGES","1")),"items":10,"base_year":int(os.getenv("NIPA_MIN_YEAR","2025"))}},
+            {"tool":"day2.rag","params":{"k":5}}
         ]
-        obj["reasons"].append("web-fallback-default")
+        return {"intent":"government","confidence":0.85,"reasons":["gov-keyword"],"plan":plan,"route":"PLANNER_ONLY","hits":[]}
 
-    # 라우팅 메타
-    obj["route"] = "WEB_FALLBACK" if len(hits) == 0 else "PLANNER_ONLY"
-    obj["hits"] = hits
+    # RAG-first quick check
+    ok, hits, top = _rag_ok(query)
 
-    # 디버깅 가시성(원하면 주석 해제)
-    # print(f"[Router:RAG] ntotal={store.ntotal()} hits={len(hits)} top={(hits[0]['score'] if hits else 0):.3f}")
+    # [NEW] 최신성 포함 시엔 RAG 즉답 금지 → 하이브리드 플랜으로 유도
+    if ok and not _has_recent(query):
+        ans = answer_with_context(query, hits, k_refs=3)
+        return {
+            "intent":"answer","confidence":0.9,"reasons":["rag-first-ok"],
+            "plan":[{"tool":"day2.rag","params":{"k":6}}],
+            "route":"RAG","hits":hits,"answer":ans,"top":top
+        }
 
+    # fallback / 혹은 최신성 → 하이브리드 기본 플랜
+    try:
+        obj = json.loads(asyncio.run(_ask_planner(query)))
+    except Exception:
+        obj = {}
+    if not isinstance(obj, dict) or "plan" not in obj:
+        obj = {
+            "plan":[
+                {"tool":"day2.rag","params":{"k":5}},
+                {"tool":"day1.research","params":{"top_n":5,"summarize_top":2}}
+            ],
+            "final_output":"research_report",
+            "reasons":["fallback-minimal" + ("-recent" if _has_recent(query) else "")]
+        }
+    obj.setdefault("final_output","research_report")
+    obj.setdefault("reasons",[])
+    obj["route"]="PLANNER_ONLY"; obj["hits"]=hits; obj["top"]=top
     return obj
