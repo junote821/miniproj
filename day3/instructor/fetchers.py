@@ -65,13 +65,10 @@ def map_nipa_links_by_keywords(list_url: str, keywords: List[str], max_pages: in
     for kw in kw_list:
         kw_enc = urllib.parse.quote(kw)
         for page in range(1, max_pages+1):
-            # 페이지네이션이 서버쪽에 어떤 파라미터를 쓰는지는 페이지 구조에 따라 다름.
-            # 기본은 srchText만으로도 최신순 일부가 노출되므로 page=는 우선 생략(필요시 추가).
             url = f"{list_url}?srchKey=title&srchText={kw_enc}"
             try:
                 html = _get_html(url)
                 soup = BeautifulSoup(html, "html.parser")
-                # 목록 테이블/리스트 영역에서 상세 링크 추출
                 cand_urls: List[str] = []
                 for a in soup.find_all("a", href=True):
                     href = a["href"]
@@ -88,7 +85,7 @@ def map_nipa_links_by_keywords(list_url: str, keywords: List[str], max_pages: in
                 print(f"[NIPA][map-kw][ERROR] kw='{kw}' page={page} -> {e}")
                 continue
 
-    # 키워드로도 충분히 못 모았다면(방화벽/봇차단 등) Firecrawl map로 보완
+    # 키워드로도 충분히 못 모았다면 Firecrawl map로 보완
     if not links:
         print("[NIPA][map-kw] fallback to Firecrawl map (no links via HTML)")
         for page in range(1, max_pages+1):

@@ -1,4 +1,4 @@
-import os, re, glob, hashlib, requests
+import os, re, glob, hashlib, requests, json
 from typing import List, Dict, Tuple, Optional
 from dotenv import load_dotenv, find_dotenv
 from bs4 import BeautifulSoup
@@ -16,7 +16,6 @@ def read_md_file(path: str) -> str:
     return read_text_file(path)
 
 def read_pdf_file(path: str) -> str:
-    # 가장 간단한 방식: 유니코드 추출 시도 (PyPDF2 등 없을 때)
     try:
         from PyPDF2 import PdfReader
         reader = PdfReader(path)
@@ -30,31 +29,46 @@ def read_pdf_file(path: str) -> str:
     except Exception:
         return ""
 
-def read_url_text(url: str) -> str:
+def read_url_text(url: str) -> Tuple[str, str]:
     r = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=REQUEST_TIMEOUT)
     r.raise_for_status()
     html = r.text
     soup = BeautifulSoup(html, "html.parser")
     for t in soup(["script", "style", "noscript"]):
         t.decompose()
+    title = (soup.title.string.strip() if soup.title and soup.title.string else url)
+    # H1이 있으면 보조 타이틀
+    h1 = soup.find("h1")
+    if h1 and h1.get_text(strip=True):
+        title = h1.get_text(strip=True)
     text = re.sub(r"\s+", " ", soup.get_text(" ", strip=True))
-    return text
+    return (title, text)
 
 def read_text_auto(path_or_url: str) -> Tuple[str, str]:
     # 반환: (title, text)
     if re.match(r"^https?://", path_or_url):
-        text = read_url_text(path_or_url)
-        return (path_or_url, text)
+        return read_url_text(path_or_url)
+
     lower = path_or_url.lower()
     if lower.endswith(".pdf"):
         return (os.path.basename(path_or_url), read_pdf_file(path_or_url))
     if lower.endswith(".md"):
-        return (os.path.basename(path_or_url), read_md_file(path_or_url))
+        # 첫 헤더를 타이틀로
+        txt = read_md_file(path_or_url)
+        m = re.search(r"^\s*#\s+(.+)$", txt, flags=re.M)
+        title = m.group(1).strip() if m else os.path.basename(path_or_url)
+        return (title, txt)
     if lower.endswith(".txt"):
-        return (os.path.basename(path_or_url), read_text_file(path_or_url))
-    # 기본 텍스트 시도
+        txt = read_text_file(path_or_url)
+        first = (txt.strip().splitlines() or [""])[0].strip()
+        title = first[:80] or os.path.basename(path_or_url)
+        return (title, txt)
+
     try:
-        return (os.path.basename(path_or_url), read_text_file(path_or_url))
+        txt = read_text_file(path_or_url)
+        first = (txt.strip().splitlines() or [""])[0].strip()
+        title = first[:80] or os.path.basename(path_or_url)
+        return (title, txt)
     except Exception:
         return (os.path.basename(path_or_url), "")
 
@@ -70,24 +84,30 @@ def chunk_text(text: str, chunk_size: int = 800, overlap: int = 100) -> List[str
 
 def collect_sources_from_folder(folder: str = RAW_DIR) -> List[str]:
     paths = []
-    # txt/md/pdf
     for pat in ("*.txt", "*.md", "*.pdf"):
         paths += glob.glob(os.path.join(folder, pat))
-    # urls.txt 자동 로드
     url_list = os.path.join(folder, "urls.txt")
     if os.path.exists(url_list):
         for line in open(url_list, "r", encoding="utf-8"):
             u = line.strip()
-            if not u:
-                continue
-            paths.append(u)
+            if u:
+                paths.append(u)
     return paths
 
 def ingest_sources(paths: Optional[List[str]] = None,
-                   chunk_size: int = 800, overlap: int = 100,
-                   kind: str = "generic") -> List[Dict]:
+                   chunk_size: int = 800,
+                   overlap: int = 100,
+                   kind: str = "generic",
+                   out_dir: str = "data/processed/day2/faiss",
+                   save_chunks: bool = True) -> List[Dict]:
+    """
+    paths: 파일/URL 리스트(없으면 RAW_DIR에서 수집)
+    반환: [{"id","text","source","page","kind","title"}, ...]
+    - save_chunks=True이면 out_dir/chunks.jsonl 로 라인 단위 JSON 저장
+    """
     paths = paths or collect_sources_from_folder(RAW_DIR)
     out: List[Dict] = []
+
     for p in paths:
         title, text = read_text_auto(p)
         if not text:
@@ -95,7 +115,7 @@ def ingest_sources(paths: Optional[List[str]] = None,
         chunks = chunk_text(text, chunk_size=chunk_size, overlap=overlap)
         base = title or os.path.basename(p)
         for j, t in enumerate(chunks, 1):
-            cid = hashlib.md5((base + str(j)).encode("utf-8")).hexdigest()
+            cid = hashlib.md5((base + "::" + str(j)).encode("utf-8")).hexdigest()
             out.append({
                 "id": cid,
                 "text": t,
@@ -104,4 +124,13 @@ def ingest_sources(paths: Optional[List[str]] = None,
                 "kind": kind,
                 "title": base,
             })
+
+    if save_chunks:
+        os.makedirs(out_dir, exist_ok=True)
+        jpath = os.path.join(out_dir, "chunks.jsonl")
+        with open(jpath, "w", encoding="utf-8") as f:
+            for row in out:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        print(f"[Ingest] wrote {len(out)} chunks → {jpath}")
+
     return out

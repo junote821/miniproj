@@ -1,28 +1,71 @@
-import os, numpy as np
+import os, numpy as np, re
 from typing import List, Dict
 from litellm import embedding
+from day3.instructor.parsers import compute_days_left
 
 EMB_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
 
-def _embed(texts: List[str]) -> np.ndarray:
-    vecs = []
-    for t in texts:
-        r = embedding(model=EMB_MODEL, input=t)
-        vecs.append(r["data"][0]["embedding"])
-    X = np.array(vecs, dtype="float32")
-    X = X / (np.linalg.norm(X, axis=1, keepdims=True) + 1e-9)
-    return X
+def _embed_one(t: str) -> np.ndarray:
+    r = embedding(model=EMB_MODEL, input=t or "")
+    v = np.array(r["data"][0]["embedding"], dtype="float32")
+    v = v / (np.linalg.norm(v) + 1e-9)
+    return v
 
-def rank_items(query: str, items: List[Dict], w_sim: float = 0.6, w_recency: float = 0.4) -> List[Dict]:
+def _embed_many(texts: List[str]) -> np.ndarray:
+    vecs=[]
+    for t in texts:
+        vecs.append(_embed_one(t))
+    return np.stack(vecs, axis=0)
+
+STOP = {"사업","공고","모집","지원","안내","찾아줘","요약","최신","결과","정보","공지"}
+
+def _keyword_score(item: Dict, keywords: List[str]) -> float:
+    blob = f"{item.get('title','')} {item.get('summary','')}".lower()
+    atts = " ".join([(a.get("name") or "") for a in (item.get("attachments") or [])]).lower()
+    text = blob + " " + atts
+    if not keywords: return 0.0
+    s = 0.0; denom = 0
+    for k in keywords:
+        if not k or k in STOP: continue
+        denom += 1
+        if re.search(rf"\b{re.escape(k)}\b", text): s += 1.0
+        elif k in text: s += 0.5
+    if denom == 0: return 0.0
+    return min(1.0, s/denom)
+
+def rank_notices(query: str, items: List[Dict], keywords: List[str],
+                 w_deadline: float = 0.5, w_sim: float = 0.3, w_kw: float = 0.2) -> List[Dict]:
     if not items: return []
+
+    # 의미 유사도
+    Q = _embed_one(query)
     texts = [(it.get("title","")+" "+it.get("summary","")).strip() for it in items]
-    Q = _embed([query])[0]
-    X = _embed(texts)
-    sim = X @ Q
-    rec = np.array([1.0 if it.get("date") else 0.0 for it in items], dtype="float32")
-    total = w_sim*sim + w_recency*rec
+    X = _embed_many(texts)
+    sim = (X @ Q)
+
+    # 마감 임박 점수: 오늘 기준 (days_left=0 → 1점, 30일 이상 → 0점으로 선형 감소)
+    dl = np.array([compute_days_left(it.get("close_date")) for it in items], dtype="float32")
+    dl_norm = np.zeros_like(dl)
+    for i, d in enumerate(dl):
+        if np.isnan(d): 
+            dl_norm[i] = 0.2  # 마감일 미표기: 낮은 기본 점수
+        else:
+            if d < 0: dl_norm[i] = 0.0               # 이미 마감
+            elif d >= 30: dl_norm[i] = 0.0          # 30일 넘게 남음 → 긴급성 낮음
+            else: dl_norm[i] = (30 - d) / 30.0      # 0일 남음 → 1.0
+
+    # 키워드 적합도
+    kw = np.array([_keyword_score(it, keywords) for it in items], dtype="float32")
+
+    total = w_deadline*dl_norm + w_sim*sim + w_kw*kw
     order = np.argsort(-total)
-    ranked = []
+
+    ranked=[]
     for idx in order:
-        it = dict(items[idx]); it["score"] = float(total[idx]); ranked.append(it)
+        it = dict(items[idx])
+        it["score_deadline"] = float(dl_norm[idx])
+        it["score_sim"] = float(sim[idx])
+        it["score_kw"] = float(kw[idx])
+        it["score"] = float(total[idx])
+        ranked.append(it)
     return ranked

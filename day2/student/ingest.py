@@ -1,135 +1,96 @@
-# Day2 스캐폴딩
-# 목적: 폴더/URL의 문서를 읽어 텍스트화 → 청크로 쪼개고 메타데이터를 붙여 반환
-
-import os, re, json, hashlib, requests
-from pathlib import Path
+import os, glob, hashlib
 from typing import List, Dict
-from bs4 import BeautifulSoup
-from pypdf import PdfReader
+from dotenv import load_dotenv, find_dotenv
+load_dotenv(find_dotenv(), override=False)
 
-# ENV 키 (변경하지 말 것)
-USER_AGENT = os.getenv("RAG_USER_AGENT", "Mozilla/5.0 (Day2-Ingest-Student)")
-REQUEST_TIMEOUT = int(os.getenv("RAG_REQUEST_TIMEOUT", "15"))
+from day2.student.rag_store import FaissStore
+
 RAW_DIR = os.getenv("RAG_RAW_DIR", "data/raw")
-PROCESSED_DIR = os.getenv("RAG_PROCESSED_DIR", "data/processed/day2")
-URL_SNAPSHOT = os.getenv("RAG_URL_SNAPSHOT", "0") == "1"
+INDEX_DIR = os.getenv("D2_INDEX_DIR", "data/processed/day2/faiss")
 
-def _md5(s: str) -> str:
-    return hashlib.md5(s.encode("utf-8")).hexdigest()
+def _file_id(path: str) -> str:
+    h = hashlib.md5(); h.update(path.encode("utf-8")); return h.hexdigest()
 
-# --- TODO[Step B1-1]: PDF → 텍스트 추출 ---
-def read_text_from_pdf(path: str) -> str:
+def collect_sources_from_folder(raw_dir: str = RAW_DIR,
+                                allowed_exts = (".txt",".md"),
+                                recursive: bool = True) -> List[str]:
     """
-    요구사항:
-    - pypdf.PdfReader로 페이지 순회
-    - extract_text() 결과를 '\n'로 이어붙여 문자열 반환
-    - 실패한 페이지는 빈 문자열로 대체
+    TODO-D2-7: raw_dir에서 허용 확장자 파일을 모두 찾기
+    - recursive=True면 하위 폴더까지
+    - 중복 제거 후 파일 경로 리스트 반환
     """
-    # TODO: 아래를 구현
-    text_pages = []
-    with open(path, "rb") as f:
-        pdf = PdfReader(f)
-        for page in pdf.pages:
-            try:
-                text_pages.append(page.extract_text() or "")
-            except Exception:
-                text_pages.append("")
-    return "\n".join(text_pages)
+    pattern = "**/*" if recursive else "*"
+    files = [p for p in glob.glob(os.path.join(raw_dir, pattern), recursive=recursive)
+             if os.path.splitext(p)[1].lower() in allowed_exts]
+    return sorted(list(set(files)))
 
-# --- TODO[Step B1-2]: URL → 텍스트 추출 ---
-def read_text_from_url(url: str, timeout: int = REQUEST_TIMEOUT) -> str:
-    """
-    요구사항:
-    - requests.get(url, headers={'User-Agent': USER_AGENT}, timeout=timeout)
-    - BeautifulSoup로 파싱하고 script/style/noscript 제거
-    - soup.get_text(' ', strip=True) → 공백 정규화(r'\s+' → ' ')
-    - URL_SNAPSHOT=1이면 RAW_DIR/url_snapshots/에 txt로 저장
-    """
-    # TODO: 아래를 구현
-    r = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=timeout)
-    r.raise_for_status()
-    soup = BeautifulSoup(r.text, "html.parser")
-    for tag in soup(["script", "style", "noscript"]):
-        tag.decompose()
-    text = re.sub(r"\s+", " ", soup.get_text(" ", strip=True))
-    if URL_SNAPSHOT:
-        out_dir = Path(RAW_DIR) / "url_snapshots"
-        out_dir.mkdir(parents=True, exist_ok=True)
-        safe = _md5(url) + ".txt"
-        (out_dir / safe).write_text(text, encoding="utf-8", errors="ignore")
-    return text
-
-# --- TODO[Step B1-3]: 단일 소스 자동 판별 ---
 def read_text_auto(src: str) -> Dict:
     """
-    입력: 파일 경로(.pdf/.txt/.md 등) 또는 http(s) URL
-    출력: {'text': <str>, 'meta': {'source':<str>, 'type':<str>, 'title':<str>}}
-    - URL이면 type='url', title=src
-    - 파일이면 type=확장자(점 제거), title=파일명
+    TODO-D2-8: 파일 경로(src)에서 텍스트 읽어서 dict 반환
+    - {"text": str, "meta": {"source": src, "title": basename, "type":"file"}}
+    - (선택) URL 처리: requests+BS4
     """
-    if src.startswith(("http://", "https://")):
-        txt = read_text_from_url(src)
-        meta = {"source": src, "type": "url", "title": src}
-    else:
-        p = Path(src)
-        if not p.exists():
-            raise FileNotFoundError(src)
-        if p.suffix.lower() == ".pdf":
-            txt = read_text_from_pdf(str(p))
-        else:
-            txt = p.read_text(encoding="utf-8", errors="ignore")
-        meta = {"source": str(p), "type": p.suffix.lower().lstrip(".") or "file", "title": p.name}
-    return {"text": txt, "meta": meta}
+    try:
+        with open(src, "r", encoding="utf-8") as f:
+            text = f.read()
+    except Exception:
+        text = ""
+    return {"text": text, "meta": {"source": src, "title": os.path.basename(src), "type": "file"}}
 
-# --- TODO[Step B1-4]: 청크 분할 ---
 def chunk_text(text: str, chunk_size: int = 800, overlap: int = 200) -> List[str]:
     """
-    요구사항:
-    - 공백 정규화(re.sub) 후 슬라이딩 윈도우로 자르기
-    - 길이 0인 청크는 제외
-    - 예) 0:800, 600:1400, ... (overlap=200)
+    TODO-D2-9: 공백 정규화 후 슬라이딩 윈도우로 청크 분할
+    - 빈 청크 제거
     """
-    text = re.sub(r"\s+", " ", text).strip()
+    s = " ".join((text or "").split())
+    if not s: return []
     chunks = []
-    start = 0
-    n = len(text)
-    while start < n:
-        end = min(start + chunk_size, n)
-        chunk = text[start:end]
-        if chunk.strip():
-            chunks.append(chunk)
-        if end == n:
-            break
-        start = max(0, end - overlap)
+    i = 0
+    while i < len(s):
+        chunks.append(s[i:i+chunk_size])
+        i += max(1, chunk_size - overlap)
+    return [c for c in chunks if c.strip()]
+
+def ingest_sources(sources: List[str], out_dir: str = INDEX_DIR) -> List[Dict]:
+    """
+    TODO-D2-10: 각 파일을 읽어 청크 리스트 생성
+    - 청크 스키마:
+      {
+        "id": md5(f"{source}::{i}"),
+        "text": <chunk>,
+        "source": <path or url>,
+        "page": i+1,
+        "kind": "local",
+        "title": <파일명 or 도메인>
+      }
+    - 반환: 모든 청크 리스트
+    """
+    import hashlib
+    chunks: List[Dict] = []
+    for src in sources:
+        obj = read_text_auto(src)
+        text, meta = obj["text"], obj["meta"]
+        for i, ck in enumerate(chunk_text(text)):
+            cid = hashlib.md5(f"{meta['source']}::{i}".encode("utf-8")).hexdigest()
+            chunks.append({
+                "id": cid,
+                "text": ck,
+                "source": meta["source"],
+                "page": i+1,
+                "kind": "local",
+                "title": meta["title"]
+            })
     return chunks
 
-# --- TODO[Step B1-5]: 여러 소스를 인제스트 ---
-def ingest_sources(sources: List[str], out_dir: str | None = None) -> List[Dict]:
-    """
-    반환: [{id, text, source, page, kind, title}, ...]
-    - id = md5(source + '::' + page_idx)
-    - out_dir 기본값은 PROCESSED_DIR
-    - 완료 후 out_dir/chunks.jsonl로 저장(한 줄에 하나의 JSON)
-    """
-    out_dir = out_dir or PROCESSED_DIR
-    os.makedirs(out_dir, exist_ok=True)
+def main():
+    os.makedirs(INDEX_DIR, exist_ok=True)
+    files = collect_sources_from_folder(RAW_DIR)
+    print(f"[INGEST] found files: {len(files)}")
+    chunks = ingest_sources(files, INDEX_DIR)
+    store = FaissStore.load_or_new(index_dir=INDEX_DIR)
+    ntotal, n_added = store.upsert(chunks)
+    print(f"[INGEST] total={ntotal}, added={n_added}")
+    print(f"[INGEST] index_dir={INDEX_DIR}")
 
-    all_chunks: List[Dict] = []
-    for src in sources:
-        data = read_text_auto(src)
-        parts = chunk_text(data["text"])
-        for i, c in enumerate(parts):
-            cid = _md5(f"{data['meta']['source']}::{i}")
-            all_chunks.append({
-                "id": cid,
-                "text": c,
-                "source": data["meta"]["source"],
-                "page": i + 1,
-                "kind": data["meta"]["type"],
-                "title": data["meta"]["title"],
-            })
-
-    with open(os.path.join(out_dir, "chunks.jsonl"), "w", encoding="utf-8") as f:
-        for ch in all_chunks:
-            f.write(json.dumps(ch, ensure_ascii=False) + "\n")
-    return all_chunks
+if __name__ == "__main__":
+    main()

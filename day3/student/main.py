@@ -21,6 +21,7 @@ load_dotenv(find_dotenv(), override=False)
 from day3.student.fetchers import fetch_nipa_list
 from day3.student.normalize import normalize_items, deduplicate
 from day3.student.agents import summarize_text_points
+from day3.student.ranker import rank_items
 
 # ---------- 키워드 추출 ----------
 
@@ -143,21 +144,11 @@ def main():
     pool = deduplicate(normalize_items(items, "government"))
 
     # 3) 간단 랭킹 (키워드 OR + 최근성)
-    ranked=[]
-    for it in pool:
-        ks = keyword_score(it, q_keywords)   # 0~1
-        rec = 0.0
-        if it.get("announce_date"):
-            try:
-                y=int(it["announce_date"][:4])
-                base=int(os.getenv("NIPA_MIN_YEAR","2024"))
-                rec = 0.3 if y>=base else 0.0
-            except Exception:
-                pass
-        # TODO-E: 가중치 조정
-        it["score"] = ks*0.7 + rec*0.3
-        ranked.append(it)
-    ranked.sort(key=lambda x: x["score"], reverse=True)
+    ranked = rank_items(
+        query, pool, q_keywords, 
+        w_kw=0.7, w_recency=0.3,
+        base_year=int(os.getenv("NIPA_MIN_YEAR", "2025"))
+    )
     ranked = annotate_matches(ranked, q_keywords)
 
     # 4) Digest 렌더링

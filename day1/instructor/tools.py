@@ -1,5 +1,5 @@
-# day1/instructor/tools.py  (FIXED: no AgentTool base)
 import os
+import re
 import time
 import requests
 from typing import Any, Dict, List, Callable
@@ -14,6 +14,29 @@ def _retry(fn, tries=2, delay=0.8):
             if i == tries - 1:
                 raise
             time.sleep(delay)
+
+# --- 간단한 노이즈 제거 (요약 전에 1차 정리) ---
+_NOISE_BLOCK = re.compile(
+    r"(개인정보 처리방침|개인정보처리방침|이용약관|사이트맵|고객센터|관련사이트|상단으로|"
+    r"바로가기|주요사업|윤리경영|ESG|인권경영|공시|스크립트가 비활성화|자바스크립트|"
+    r"메뉴|푸터|네비게이션|로그인|회원가입)", re.I
+)
+
+def _clean_web_text(t: str, max_chars: int) -> str:
+    if not t:
+        return ""
+    # 너무 긴 문서면 먼저 자르고
+    t = t[: max_chars * 2]
+    # 코드/스크립트 흔적 간단 제거
+    t = re.sub(r"<script[\s\S]*?</script>", " ", t, flags=re.I)
+    t = re.sub(r"<style[\s\S]*?</style>", " ", t, flags=re.I)
+    # 노이즈 키워드 이후는 과감히 컷 (대부분 푸터/전사 메뉴)
+    m = _NOISE_BLOCK.search(t)
+    if m:
+        t = t[: m.start()]
+    # 공백 정리
+    t = re.sub(r"\s+", " ", t)
+    return t.strip()[: max_chars]
 
 class WebSearchTool:
     """
@@ -50,6 +73,7 @@ class WebSearchTool:
 
     def run(self, query: str) -> List[Dict[str, str]]:
         if not self.api_key:
+            # 오프라인/테스트 모드
             return [
                 {"title": f"[MOCK] {query} A", "url": "https://example.com/a", "snippet": "샘플 A"},
                 {"title": f"[MOCK] {query} B", "url": "https://example.com/b", "snippet": "샘플 B"},
@@ -81,12 +105,13 @@ class SummarizeUrlTool:
         )
         resp.raise_for_status()
         data = resp.json()
-        return (data.get("markdown") or data.get("rawText") or "")[: self.max_chars]
+        text = (data.get("markdown") or data.get("rawText") or "")
+        return _clean_web_text(text, self.max_chars)
 
     def _simple_get(self, url: str) -> str:
         r = requests.get(url, timeout=REQUEST_TIMEOUT)
         r.raise_for_status()
-        return (r.text or "")[: self.max_chars]
+        return _clean_web_text(r.text or "", self.max_chars)
 
     def run(self, url: str) -> Dict[str, Any]:
         text = ""

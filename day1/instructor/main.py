@@ -29,7 +29,6 @@ def smoke_run(user_query: str):
         url_sum = SummarizeUrlTool(summarize_text).run(results[0]["url"])
 
     md = as_markdown(user_query, label, results, url_sum)
-    # 콘솔 출력
     print(md)
 
     os.makedirs("data/processed", exist_ok=True)
